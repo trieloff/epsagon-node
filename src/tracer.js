@@ -12,6 +12,7 @@ const utils = require('./utils.js');
 const config = require('./config.js');
 const eventInterface = require('./event.js');
 const consts = require('./consts.js');
+const ecs = require('./containers/ecs.js');
 
 
 /**
@@ -68,7 +69,9 @@ module.exports.addEvent = function addEvent(event, promise) {
     if (promise !== undefined) {
         tracerObj.pendingEvents.set(
             event,
-            utils.makeQueryablePromise(utils.reflectPromise(promise))
+            utils.makeQueryablePromise(promise.catch((err) => {
+                module.exports.addException(err);
+            }))
         );
     }
 
@@ -77,10 +80,11 @@ module.exports.addEvent = function addEvent(event, promise) {
 
 /**
  * Adds an exception to the tracer
- * @param {Error} error The error object describing the exception
+ * @param {Error} userError The error object describing the exception
  * @param {Object} additionalData Additional data to send with the error. A map of <string: string>
  */
-module.exports.addException = function addException(error, additionalData) {
+module.exports.addException = function addException(userError, additionalData) {
+    const error = userError || new Error();
     const raisedException = new exception.Exception([
         error.name,
         error.message,
@@ -112,6 +116,11 @@ module.exports.addException = function addException(error, additionalData) {
 module.exports.initTrace = function initTrace(
     configData
 ) {
+    const ecsMetaUri = ecs.hasECSMetadata();
+    if (ecsMetaUri) {
+        ecs.loadECSMetadata(ecsMetaUri).catch(err => utils.debugLog(err));
+    }
+
     config.setConfig(configData);
 };
 
@@ -124,8 +133,12 @@ module.exports.initTrace = function initTrace(
  */
 module.exports.addRunner = function addRunner(runner, runnerPromise) {
     const tracerObj = module.exports.getTrace();
+    if (!tracerObj) {
+        return;
+    }
     tracerObj.trace.addEvent(runner, runnerPromise);
     tracerObj.currRunner = runner;
+    ecs.addECSMetadata(tracerObj.currRunner);
 };
 
 /**
@@ -134,6 +147,9 @@ module.exports.addRunner = function addRunner(runner, runnerPromise) {
  */
 module.exports.restart = function restart() {
     const tracerObj = module.exports.getTrace();
+    if (!tracerObj) {
+        return;
+    }
     tracerObj.trace.clearExceptionList();
     tracerObj.trace.clearEventList();
     tracerObj.trace.setAppName(config.getConfig().appName);
@@ -196,11 +212,13 @@ function stripOperations(traceJson, attempt) {
  * handled
  * @param {function} traceSender: The function to use to send the trace. Gets the trace object
  *     as a parameter and sends a JSON version of it to epsagon's infrastructure
- * @param {Object} tracer  Optional tracer
  * @return {*} traceSender's result
  */
 function sendCurrentTrace(traceSender) {
     const tracerObj = module.exports.getTrace();
+    if (!tracerObj) {
+        return Promise.resolve();
+    }
     const traceJson = {
         app_name: tracerObj.trace.getAppName(),
         token: tracerObj.trace.getToken(),
@@ -254,6 +272,57 @@ function sendCurrentTrace(traceSender) {
     return sendResult;
 }
 
+
+/**
+ * Filter a trace to exclude all unwanted keys
+ * @param {Object} traceObject  the trace to filter
+ * @param {Array<String>} ignoredKeys   keys to ignore
+ * @returns {Object}  filtered trace
+ */
+module.exports.filterTrace = function filterTrace(traceObject, ignoredKeys) {
+    /**
+     * Check if a given param is an object
+     * @param {*} x   param to check
+     * @returns {boolean}   if `x` is an object
+     */
+    function isObject(x) {
+        return (typeof x === 'object') && x !== null;
+    }
+
+    /**
+     * Recursivly filter object properties
+     * @param {Object} obj  object to filter
+     * @returns {Object} filtered object
+     */
+    function filterObject(obj) {
+        const keys = Object
+            .keys(obj)
+            .map(config.processIgnoredKey)
+            .filter((k => !ignoredKeys.includes(k)));
+
+        const primitive = keys.filter(k => !isObject(obj[k]));
+        const objects = keys
+            .filter(k => isObject(obj[k]))
+            .map(k => ({ [k]: filterObject(obj[k]) }));
+
+        return Object.assign({},
+            primitive.reduce((sum, key) => Object.assign({}, sum, { [key]: obj[key] }), {}),
+            objects.reduce((sum, value) => Object.assign({}, sum, value), {}));
+    }
+
+    const events = traceObject.events.map((event) => {
+        if (!(event && event.resource && event.resource.metadata)) {
+            return event;
+        }
+
+        const filteredEvent = Object.assign({}, event);
+        filteredEvent.resource.metadata = filterObject(event.resource.metadata);
+        return filteredEvent;
+    });
+
+    return Object.assign({}, traceObject, { events });
+};
+
 /**
  * Post given trace to epsagon's infrastructure.
  * @param {*} traceObject The trace data to send.
@@ -262,9 +331,16 @@ function sendCurrentTrace(traceSender) {
 module.exports.postTrace = function postTrace(traceObject) {
     utils.debugLog(`Posting trace to ${config.getConfig().traceCollectorURL}`);
     utils.debugLog(`trace: ${JSON.stringify(traceObject, null, 2)}`);
+
+    const { ignoredKeys } = config.getConfig();
+    const filteredTrace = ignoredKeys &&
+        Array.isArray(ignoredKeys) &&
+        ignoredKeys.length > 0 ?
+        module.exports.filterTrace(traceObject, ignoredKeys) : traceObject;
+
     return session.post(
         config.getConfig().traceCollectorURL,
-        traceObject,
+        filteredTrace,
         { headers: { Authorization: `Bearer ${config.getConfig().token}` } }
     ).then((res) => {
         utils.debugLog('Trace posted!');
@@ -284,6 +360,9 @@ module.exports.postTrace = function postTrace(traceObject) {
 module.exports.sendTrace = function sendTrace(runnerUpdateFunc) {
     utils.debugLog('Sending trace async');
     const tracerObj = module.exports.getTrace();
+    if (!tracerObj) {
+        return Promise.resolve();
+    }
     return Promise.all(tracerObj.pendingEvents.values()).then(() => {
         // Setting runner's duration.
         runnerUpdateFunc();
@@ -300,6 +379,9 @@ module.exports.sendTrace = function sendTrace(runnerUpdateFunc) {
 module.exports.sendTraceSync = function sendTraceSync() {
     utils.debugLog('Sending trace sync');
     const tracerObj = module.exports.getTrace();
+    if (!tracerObj) {
+        return Promise.resolve();
+    }
 
     tracerObj.pendingEvents.forEach((promise, event) => {
         if (promise.isPending()) {

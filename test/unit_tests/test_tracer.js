@@ -26,13 +26,78 @@ describe('tracer restart tests - if these fail the others will too', () => {
         tracer.getTrace = tracerObj.get;
         tracer.initTrace({ token: 'token', appName: 'app' });
         tracer.addEvent(new serverlessEvent.Event());
-        tracer.addException(Error('test error'));
+        tracer.addException(new Error('test error'));
         tracer.restart();
         tracer.addRunner(new serverlessEvent.Event());
         expect(tracerObj.get().trace.getEventList().length).to.equal(1);
         expect(tracerObj.get().trace.getExceptionList()).to.be.empty;
         expect(tracerObj.get().trace.getAppName()).to.equal('app');
         expect(tracerObj.get().trace.getToken()).to.equal('token');
+    });
+});
+
+describe('filter keys function', () => {
+    it('filterTrace: filter from metadata', () => {
+        const traceObject = {
+            events: [{
+                resource: {
+                    metadata: {
+                        studentId: 'personal',
+                        message: 'not-personal',
+                    },
+                },
+            }],
+        };
+        const ignoredKeys = ['studentid'];
+        const filtered = tracer.filterTrace(traceObject, ignoredKeys);
+        const expected = {
+            events: [{
+                resource: {
+                    metadata: { message: 'not-personal' },
+                },
+            }],
+        };
+
+        expect(filtered).to.deep.equal(expected);
+    });
+
+    it('filterTrace: filter event without metadata', () => {
+        const traceObject = {
+            events: [{
+                resource: {
+                    something: 'bla',
+                },
+            }],
+        };
+        const ignoredKeys = ['studentid'];
+        const filtered = tracer.filterTrace(traceObject, ignoredKeys);
+        expect(filtered).to.deep.equal(traceObject);
+    });
+
+    it('filterTrace: filter recursively', () => {
+        const traceObject = {
+            events: [{
+                resource: {
+                    metadata: {
+                        field: {
+                            studentId: 'personal',
+                            message: 'not-personal',
+                        },
+                    },
+                },
+            }],
+        };
+        const ignoredKeys = ['studentid'];
+        const filtered = tracer.filterTrace(traceObject, ignoredKeys);
+        const expected = {
+            events: [{
+                resource: {
+                    metadata: { field: { message: 'not-personal' } },
+                },
+            }],
+        };
+
+        expect(filtered).to.deep.equal(expected);
     });
 });
 
